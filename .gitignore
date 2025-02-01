@@ -1,0 +1,41 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node modules
+node_modules/
+
+# Credentials
+.env
+.env.*
+
+# Model files and large data
+models/
+*.h5
+*.pt
+*.pkl
+*.tar.gz
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
