@@ -299,6 +299,9 @@ def explore_and_fetch_metadata(input_path, json_file, max_workers=8, cache_size_
 # --------------------------------------------------
 if __name__ == '__main__':
     # Replace with your actual folder or file path.
-    input_path = "path/to/parent/folder_or_music_file"
+    start = time.time()
+    input_path = r"D:\Music"
     json_file = "music_metadata_with_checksum.json"
     explore_and_fetch_metadata(input_path, json_file, max_workers=8)
+    end = time.time()
+    print(f"Total time taken: {end - start} seconds")

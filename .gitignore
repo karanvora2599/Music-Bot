@@ -40,3 +40,6 @@ models/
 .vscode/
 .idea/
 *.swp
+
+# Random
+Notes.txt
