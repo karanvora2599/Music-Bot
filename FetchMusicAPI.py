@@ -1,6 +1,5 @@
 import os
 import uuid
-import json
 import re
 import sys
 import hashlib
@@ -8,12 +7,17 @@ import time
 import logging
 import asyncio
 import aiofiles
+import threading
+from queue import Queue, Empty
 from logging.handlers import TimedRotatingFileHandler
 from mutagen import File
 from mutagen.mp3 import HeaderNotFoundError
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
-from queue import Queue, Empty
-import threading
+
+# --- FastAPI Imports ---
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
+import uvicorn
 
 # --------------------------------------------------
 # Logging Setup
@@ -55,9 +59,13 @@ metadata_queue = Queue()
 # Event to signal the flush thread to stop
 stop_flush_event = threading.Event()
 
+# Global dictionary to hold job statuses
+jobs = {}  # job_id -> { "status": "pending"/"running"/"completed"/"failed", "elapsed_time": float or None, "error": str or None }
+
 # --------------------------------------------------
-# Metadata Fetching and Checksum Functions
+# --- Your Existing Pipeline Functions ---
 # --------------------------------------------------
+
 def fetch_music_metadata(file_path):
     """
     Fetch metadata from a music file and return it as a dictionary.
@@ -67,7 +75,7 @@ def fetch_music_metadata(file_path):
     try:
         audio_file = File(file_path)
     except (HeaderNotFoundError, Exception) as e:
-        logger.error(f"Error reading file {file_path}: {str(e)}")
+        logger.error(f"Error reading file {file_path}: {e}")
         return {file_uuid: {"error": "File could not be read or is unsupported", "file_path": file_path}}
 
     metadata = {}
@@ -106,7 +114,7 @@ def fetch_music_metadata(file_path):
 def calculate_checksum(data):
     """
     Calculate the SHA-256 checksum of the JSON-serialized data.
-    Sorting keys ensures that the checksum is consistent regardless of key order.
+    Sorting keys ensures consistency.
     """
     sha256 = hashlib.sha256()
     try:
@@ -118,11 +126,9 @@ def calculate_checksum(data):
 async def async_write_metadata_to_json_with_checksum(json_file, cache, attempt=1):
     """
     Asynchronously write the cached metadata to the JSON file with checksum verification.
-    Uses a temporary file and, in case of a checksum mismatch or transient error,
-    retries with exponential backoff.
+    Uses a temporary file and retries with exponential backoff if needed.
     """
     try:
-        # Read existing data asynchronously
         existing_data = {}
         try:
             async with aiofiles.open(json_file, 'r') as f:
@@ -131,17 +137,14 @@ async def async_write_metadata_to_json_with_checksum(json_file, cache, attempt=1
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logger.info(f"Existing JSON file not found or corrupt: {e}")
 
-        # Merge cached data into existing data
         existing_data.update(cache)
         data_to_write = json.dumps(existing_data, indent=4, sort_keys=True)
         checksum_before = calculate_checksum(existing_data)
 
-        # Write to a temporary file asynchronously
         temp_file = json_file + ".tmp"
         async with aiofiles.open(temp_file, 'w') as f:
             await f.write(data_to_write)
 
-        # Read back the temporary file for checksum verification
         async with aiofiles.open(temp_file, 'r') as f:
             try:
                 content_read = await f.read()
@@ -155,13 +158,12 @@ async def async_write_metadata_to_json_with_checksum(json_file, cache, attempt=1
             logger.error(f"Checksum mismatch: before={checksum_before}, after={checksum_after}")
             if attempt < MAX_CHECKSUM_RETRIES:
                 logger.info(f"Retrying write operation (attempt {attempt+1}) after backoff...")
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                await asyncio.sleep(2 ** attempt)
                 return await async_write_metadata_to_json_with_checksum(json_file, cache, attempt=attempt+1)
             else:
                 logger.error("Maximum checksum retries reached. Write operation failed.")
                 return False
         else:
-            # Replace the original file with the temporary file for a fast atomic write
             os.replace(temp_file, json_file)
             logger.info("Checksum verified successfully and data written to disk.")
             return True
@@ -170,47 +172,36 @@ async def async_write_metadata_to_json_with_checksum(json_file, cache, attempt=1
         logger.error(f"Error writing metadata to JSON file asynchronously: {write_err}")
         return False
 
-# --------------------------------------------------
-# Worker Function: Process Files and Enqueue Metadata
-# --------------------------------------------------
 def process_files_worker(file_paths):
     """
-    Process each file in the provided list, fetch metadata, and place it into the thread-safe queue.
+    Process each file in the provided list using fetch_music_metadata.
+    Returns a list of metadata dictionaries.
     """
+    results = []
     for file_path in file_paths:
         try:
-            metadata = fetch_music_metadata(file_path)
-            metadata_queue.put(metadata)
-            logger.info(f"Processed: {file_path}")
+            result = fetch_music_metadata(file_path)
+            results.append(result)
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}")
+    return results
 
-# --------------------------------------------------
-# Flush Thread: Monitor Queue and Write Batches to Disk
-# --------------------------------------------------
 def flush_cache_worker(json_file, cache_size_limit, flush_interval=FLUSH_INTERVAL):
     """
-    Dedicated flushing thread that continuously monitors the metadata_queue.
-    Every flush_interval seconds, it accumulates available items into a batch
-    and flushes them to disk using asynchronous I/O.
+    Flush thread: every flush_interval seconds, drain the metadata_queue
+    and write the batch to disk asynchronously.
     """
     batch = {}
     while not (stop_flush_event.is_set() and metadata_queue.empty()):
-        # Wait for flush_interval seconds
         time.sleep(flush_interval)
-
-        # Drain available items from the queue into the batch
         while True:
             try:
                 metadata_item = metadata_queue.get_nowait()
                 batch.update(metadata_item)
             except Empty:
                 break
-
-        # If there is data to flush, write it out asynchronously.
         if batch:
             logger.info(f"Flushing batch to JSON file (batch size: {sys.getsizeof(batch)} bytes)...")
-            # Run the asynchronous write in a temporary event loop
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             success = loop.run_until_complete(async_write_metadata_to_json_with_checksum(json_file, batch))
@@ -219,8 +210,6 @@ def flush_cache_worker(json_file, cache_size_limit, flush_interval=FLUSH_INTERVA
                 batch.clear()
             else:
                 logger.warning("Failed to flush batch. Retaining data for retry.")
-
-    # Final flush of any remaining data in the batch
     if batch:
         logger.info("Final flush of remaining batch to JSON file...")
         loop = asyncio.new_event_loop()
@@ -228,14 +217,9 @@ def flush_cache_worker(json_file, cache_size_limit, flush_interval=FLUSH_INTERVA
         loop.run_until_complete(async_write_metadata_to_json_with_checksum(json_file, batch))
         loop.close()
 
-# --------------------------------------------------
-# Utility: Get Supported File Paths from Input
-# --------------------------------------------------
 def get_file_paths(input_path):
     """
-    Return a list of supported music file paths.
-    If input_path is a file, return a list containing that file (if supported).
-    If input_path is a directory, recursively search for supported files.
+    Return a list of supported music file paths given an input path (file or directory).
     """
     supported_extensions = (".mp3", ".flac", ".wav", ".m4a", ".ogg")
     file_paths = []
@@ -253,18 +237,18 @@ def get_file_paths(input_path):
         logger.error(f"Input path {input_path} does not exist.")
     return file_paths
 
-# --------------------------------------------------
-# Main Function: Explore Input and Process Files
-# --------------------------------------------------
 def explore_and_fetch_metadata(input_path, json_file, max_workers=8, cache_size_limit=MEMORY_CACHE_LIMIT):
     """
-    Given an input path (a folder or a single file), collect supported file paths and then use multithreading
-    to fetch metadata and enqueue it. A dedicated flushing thread will periodically flush the metadata to disk.
+    Main pipeline function.
+    1. Collect file paths.
+    2. Start the flush thread.
+    3. Use ProcessPoolExecutor to process files in parallel.
+    4. Enqueue results.
+    5. Signal the flush thread to finish.
     """
     file_paths = get_file_paths(input_path)
     logger.info(f"Total music files found: {len(file_paths)}")
 
-    # Start the dedicated flush thread
     flush_thread = threading.Thread(
         target=flush_cache_worker,
         args=(json_file, cache_size_limit),
@@ -272,34 +256,101 @@ def explore_and_fetch_metadata(input_path, json_file, max_workers=8, cache_size_
     )
     flush_thread.start()
 
-    # Use ThreadPoolExecutor for processing files concurrently.
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Split file paths evenly among workers.
-            futures = [
-                executor.submit(process_files_worker, file_paths[i::max_workers])
-                for i in range(max_workers)
-            ]
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            chunked_paths = [file_paths[i::max_workers] for i in range(max_workers)]
+            futures = [executor.submit(process_files_worker, chunk) for chunk in chunked_paths]
             for future in as_completed(futures):
                 try:
-                    future.result()
+                    results = future.result()
+                    logger.info(f"Worker returned {len(results)} items.")
+                    for res in results:
+                        metadata_queue.put(res)
                 except Exception as e:
-                    logger.error(f"Error in worker thread execution: {e}")
+                    logger.error(f"Error in worker process: {e}")
     except Exception as e:
-        logger.error(f"Error using ThreadPoolExecutor: {e}")
+        logger.error(f"Error using ProcessPoolExecutor: {e}")
 
-    # Signal the flush thread to stop after all worker threads are done.
+    logger.info(f"Total items in metadata_queue before stopping: {metadata_queue.qsize()}")
     stop_flush_event.set()
     flush_thread.join()
 
 # --------------------------------------------------
-# Main Execution
+# --- FastAPI Application and API Endpoints ---
+# --------------------------------------------------
+
+app = FastAPI(
+    title="Music Metadata Extraction API",
+    description="An API that extracts metadata from music files using a high-performance pipeline.",
+    version="1.0"
+)
+
+# Request model for extraction job
+class ExtractionJobRequest(BaseModel):
+    input_path: str  # Directory or file path
+    json_file: str   # Output JSON file path
+    max_workers: int = 8
+
+# Response model for job submission
+class ExtractionJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+# Response model for job status
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    elapsed_time: float = None
+    error: str = None
+
+# In-memory job store (for demo purposes)
+jobs_store = {}  # job_id -> {"status": str, "elapsed_time": float or None, "error": str or None}
+
+def run_extraction_job(job_id: str, input_path: str, json_file: str, max_workers: int):
+    """
+    Wrapper function that runs the extraction pipeline and updates the job store.
+    This function runs in a background thread.
+    """
+    jobs_store[job_id]["status"] = "running"
+    start_time = time.time()
+    try:
+        explore_and_fetch_metadata(input_path, json_file, max_workers=max_workers)
+        elapsed = time.time() - start_time
+        jobs_store[job_id]["status"] = "completed"
+        jobs_store[job_id]["elapsed_time"] = elapsed
+        logger.info(f"Job {job_id} completed in {elapsed} seconds.")
+    except Exception as e:
+        jobs_store[job_id]["status"] = "failed"
+        jobs_store[job_id]["error"] = str(e)
+        logger.error(f"Job {job_id} failed: {e}")
+
+@app.post("/extract", response_model=ExtractionJobResponse)
+async def extract_metadata(job_request: ExtractionJobRequest, background_tasks: BackgroundTasks):
+    """
+    Start an extraction job given an input path and an output JSON file.
+    The job runs in the background and returns a job ID immediately.
+    """
+    job_id = str(uuid.uuid4())
+    # Initialize job status
+    jobs_store[job_id] = {"status": "pending", "elapsed_time": None, "error": None}
+    # Schedule the extraction job in a background thread
+    background_tasks.add_task(run_extraction_job, job_id, job_request.input_path, job_request.json_file, job_request.max_workers)
+    return ExtractionJobResponse(job_id=job_id, status="pending")
+
+@app.get("/status/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """
+    Return the status of an extraction job given its job_id.
+    """
+    if job_id in jobs_store:
+        job = jobs_store[job_id]
+        return JobStatusResponse(job_id=job_id, status=job["status"], elapsed_time=job["elapsed_time"], error=job["error"])
+    else:
+        return JobStatusResponse(job_id=job_id, status="not found", elapsed_time=None, error="Job ID not found.")
+
+# --------------------------------------------------
+# Main Execution: Run FastAPI with Uvicorn
 # --------------------------------------------------
 if __name__ == '__main__':
-    # Replace with your actual folder or file path.
-    start = time.time()
-    input_path = r"D:\Music"
-    json_file = "music_metadata_with_checksum3.json"
-    explore_and_fetch_metadata(input_path, json_file, max_workers=16)
-    end = time.time()
-    print(f"Total time taken: {end - start} seconds")
+    # For local testing, you can run this script directly.
+    uvicorn.run(app, host="0.0.0.0", port=8000)
