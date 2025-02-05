@@ -12,7 +12,7 @@ from queue import Queue, Empty
 from logging.handlers import TimedRotatingFileHandler
 from mutagen import File
 from mutagen.mp3 import HeaderNotFoundError
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- FastAPI Imports ---
 from fastapi import FastAPI, BackgroundTasks
@@ -257,7 +257,7 @@ def explore_and_fetch_metadata(input_path, json_file, max_workers=8, cache_size_
     flush_thread.start()
 
     try:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             chunked_paths = [file_paths[i::max_workers] for i in range(max_workers)]
             futures = [executor.submit(process_files_worker, chunk) for chunk in chunked_paths]
             for future in as_completed(futures):

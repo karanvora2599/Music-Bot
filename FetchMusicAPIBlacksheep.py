@@ -12,7 +12,7 @@ from queue import Queue, Empty
 from logging.handlers import TimedRotatingFileHandler
 from mutagen import File
 from mutagen.mp3 import HeaderNotFoundError
-from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pydantic import BaseModel
 
@@ -309,7 +309,7 @@ def explore_and_fetch_metadata(input_path, json_file, max_workers=8, cache_size_
     logger.info("Flush thread started successfully.")
 
     try:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             logger.info(f"Processing files using {max_workers} workers.")
             # Chunk the file paths evenly among the workers
             chunked_paths = [file_paths[i::max_workers] for i in range(max_workers)]
